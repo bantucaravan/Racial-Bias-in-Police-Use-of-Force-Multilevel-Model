@@ -1,0 +1,478 @@
+---
+title: "Noah's Data Analysis"
+author: Noah Chasek-Macfoy
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r, results='hide', message=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lme4)
+library(zoo)
+library(ggplot2)
+
+```
+
+# Regressions
+
+#### Load Data
+```{r}
+
+file <- "./Data/PDI (TEST DATA ONLY)_Use_of_Force_Cincinnati_v2_ANNOTATED.csv"
+data <- read.csv(file, stringsAsFactors = FALSE)
+
+```
+
+## Prepare Data
+
+
+Note there are a number of census tracts in the data outside of Ohio (code = 39) and outside of Hamilton county (code = 061). I will leave them for now.
+
+County Codes
+```{r}
+as.data.frame(table(data$COUNTY_FIPS[-1]))
+```
+State Codes
+```{r}
+as.data.frame(table(data$STATE_FIPS[-1]))
+```
+
+
+```{r}
+# combine state, county, and census tract ids
+tract_short <- paste0(data$STATE_FIPS, data$COUNTY_FIPS, data$LOCATION_CENSUS_TRACT)
+
+cols <- c("SUBJECT_RACE_CLEAN", "INCIDENT_DATE_CLEAN", "TYPE_OF_FORCE_USED_CLEAN")
+data <- cbind(data[cols], tract_short, stringsAsFactors=FALSE)[-1,]
+names(data)[1:3] <- c("race", "date", "force")
+
+```
+
+
+Look at non-numeric tract numbers
+```{r}
+mask <- is.na(as.numeric(tract_short))
+sum(mask) # 625
+unique(tract_short[mask])
+```
+
+Remove non-numeric census tract rows
+```{r}
+mask <- !is.na(as.numeric(tract_short))
+data <- data[mask,]
+data$tract_short <- as.numeric(data$tract_short)
+
+# save copy for visualization
+viz_data <- data
+```
+
+
+Note: only Black and White are over 5%
+```{r}
+# view racial makeup of force incidents
+df <- as.data.frame(table(data$race), stringsAsFactors = FALSE)
+df$pct <- (df$Freq/length(data$race))*100
+df
+
+# remove races less than 5% of incidence
+races <- df[df$pct > 5, 1]
+mask <- data$race %in% races
+data <- data[mask,]
+data$race <- tolower(data$race)
+```
+
+**Sources of measurment and selection bias in the data**:  
+Excluding small racial groups does not affect the number of force incidents per person ratio within non-excluded racial groups. Small racial groups must be excluded because even a small amount of race missclassification between races with disparate rates of victimization would greatly skew the number of force incidents per person in smaller groups. Also note that large bias in which race is most frequently selected into "unknown" has the potential to bias estimates of uses of force by race. This said 'unknown' accounts for 1.8% of the data and thus will likely have little impact on the estimates of racial groups which make up a greater than 5% share of the incidents.
+  
+  
+
+Load census tract population by race data.
+```{r}
+file <- "./Data/ACS_5YR_racial_population_demographics.csv"
+pop <- read.csv(file, stringsAsFactors = FALSE)
+
+# select relevant cols
+cols <- c("tract_short", "total_population", "white","black_or_african_american","other","total_hispanic_or_latino"
+          ,"asian" )
+pop <- pop[cols]
+names(pop)[c(2,4,5,6)] <- c("total_pop", "black", "other_race", "hispanic")
+pop$pct_black <- (pop$black/pop$total_pop) * 100
+
+# save copy for visualizations
+viz_pop <- pop
+
+```
+
+Note: The number of census tracts in the population data and the use of force data do not match up.
+
+183 unique census tracts in population by race data.
+```{r}
+
+## Remove census tracts in force incidents not found in population data
+length(unique(pop$tract_short))
+```
+195 unique census tracts in use of force data.
+```{r}
+length(unique(data$tract_short))
+```
+
+We see that the force incidents census tracts are a super set of the population by race data census tracks. That means there are no census tracks that we will analyze where no use of force incident was recorded between 1996 and 2018.
+```{r}
+setdiff(pop$tract_short, data$tract_short)
+
+# Remove census tracts in force incidents not found in population data
+mask <- data$tract_short %in% pop$tract_short
+count_data <- data[mask,]
+
+```
+
+
+```{r}
+
+## Get use of force counts by census tract by race
+count_data <- group_by(count_data, race, tract_short) %>%
+  summarise(count = n())
+
+# transform to by tract by race row format
+pop <- gather(pop, race, pop_race, white, black)
+
+## Merge population data onto count data
+count_data <- left_join(pop, count_data, by=c("tract_short", "race"))
+# set race tract pairs with no force incidents to count = 0
+count_data$count[is.na(count_data$count)] <- 0
+```
+
+Note: There are some etreme outliers in the use of force data. For example, one tract has a max value more than 6 times greater than the 75th percentile value. 
+```{r}
+summary(count_data)
+
+```
+
+Add all-race poverty rate by census tract.
+```{r}
+file = "./Data/ACS_5YR_poverty.csv"
+pov <- read.csv(file, stringsAsFactors = FALSE)
+
+cols <- c("GEO.id2", "HC03_EST_VC01")
+pov <- pov[-1 ,cols]
+names(pov) <- c("tract_short", "pct_pov")
+pov <- as.data.frame(lapply(pov, as.numeric)) # char to num
+```
+
+Note: there are 5 census tracts in the force count data that are not found in the poverty data, all of which outside of hamilton county however.
+```{r}
+setdiff(count_data$tract_short, pov$tract_short)
+```
+There also appear to be a number of hamilton county census tracts in the poverty dataset but not in the use of force/population by race data.
+```{r}
+setdiff(pov$tract_short,count_data$tract_short)
+```
+
+```{r}
+# Merge with count data
+count_data <- left_join(count_data, pov, by="tract_short")
+```
+Take a look at the observations we are loosing by exluding the tracts with no poverty data. A number of largely white census tracts with relatively low uses of force. The distribution suggest they will bias the results.
+```{r}
+count_data[is.na(count_data$pct_pov),]
+#(df$count/df$pop_race)[is.na(df$pct_pov)]
+``` 
+
+
+I consider filling the missing data with the pct_pov mean, but since the tracts seem relatively unrepresentatively low in terms of use of force the overall mean doesn't seem appropriate. I consider filling the NA values with the mean poverty measure for geographically proximate tracts or that of tracts that fall within the same range of uses of force per person. But I will leave that judgement for future work and exclude these observations here.
+```{r}
+count_data <- count_data[!is.na(count_data$pct_pov),]
+
+```
+
+
+
+Add part 1 crimes per person per census tract to data.
+```{r}
+file <- "./Data/PDI (TEST DATA ONLY)_Crime_Incidents_Cincinnati_2014-2015_ANNOTATED.csv"
+crime <- read.csv(file, stringsAsFactors = FALSE)
+
+s_fips <- str_pad(crime$STATE_FIPS, 2, "left", "0")
+c_fips <- str_pad(crime$COUNTY_FIPS, 3, "left", "0")
+tract <- str_pad(crime$LOCATION_CENSUS_TRACT, 6, "left", "0")
+tract_short <- paste0(s_fips, c_fips , tract)
+
+cols <- c("UNKNOWN_FIELD_TYPE.26")
+crime <- cbind(crime[cols], tract_short, stringsAsFactors=FALSE)[-1,]
+names(crime)[1] <- "ucr_type"
+
+# Remove string valued census tract rows
+mask <- !is.na(as.numeric(crime$tract_short))
+crime <- crime[mask,]
+crime$tract_short <- as.numeric(crime$tract_short)
+```
+
+
+ I am unsure of the UCR classification of "UNAUTHORIZED USE", but will include it in the part 1 count. I checked the [UCR handbook](<https://ucr.fbi.gov/additional-ucr-publications/ucr_handbook.pdf/view>) on this issue and did not find a direct indication of what "UNAUTHORIZED USE" might refer to, but it is listed as 701 in "UNKNOWN_FIELD_TYPE.4" aka "UCR" which corresponds to the listing of "moto vehicle theft" in the handbook as category 7. Other crime codes in "UNKNOWN_FIELD_TYPE.4" correspond to the crime categories in the handbook.
+
+
+Note: Not counting crimes whose UCR group is not stated. I am assuming these were not on among UCR mandatory reporting crimes.
+```{r}
+crime$part1 <- 0
+crime$part1[!(crime$ucr_type %in% c("", "PART 2 MINOR"))] <- 1
+
+crime$murder <- 0
+crime$murder[crime$ucr_type == "HOMICIDE"] <- 1
+
+# get counts part1 crimes per tract
+by_tract <- group_by(crime, tract_short) %>% summarise(part1_count = sum(part1), murder_count = sum(murder))
+crime <- by_tract
+
+# merge with count data
+count_data <- left_join(count_data, crime, by= "tract_short")
+```
+Note: there are 8 tracts in the crime data note found in the use of force data set.
+```{r}
+setdiff(crime$tract_short, data$tract_short)
+#length(setdiff(count_data$tract_short,crime$tract_short))
+```
+As with the poverty data I could choose to fill in values for these tracts without crime data but I will delete them.
+```{r}
+count_data <- count_data[!is.na(count_data$part1_count),]
+
+# number of part1 crimes per 100 people
+count_data$part1_per_capita <- (count_data$part1_count/count_data$total_pop) * 100
+
+count_data$murder_per_capita <- (count_data$murder_count/count_data$total_pop) * 1000
+```
+
+Note: that outlier with 81 part 1 crimes per 100 people... Seems suspicious.
+```{r}
+summary(count_data$part1_per_capita)
+```
+
+## Modeling
+
+### Specification 1: Race and census tract
+
+$$y=n_je^{\beta_0 + \beta_{black} X_{black} +  \alpha_j}$$
+Where $n_j$ is the population of out each racial group in each census tract, and $X_{black}$ is an indicator of black race, $\alpha_j$ is the partial-pooling (i.e. random effects) intercept deviation for each race per census tract group, and $y$ is the number of use of force indicents against a racial group in a county.
+
+
+```{r}
+# set factor with level order such that white will be reference group
+count_data$race <- factor(count_data$race, levels=c("white", "black"))
+count_data$tract_short <- factor(count_data$tract_short)
+```
+
+Fit Model
+```{r}
+m1 <- glmer(count ~ (1| tract_short) + race , offset=log(pop_race), data=count_data, family = poisson())
+
+summary(m1)
+```
+**Interpret the coeficients**:
+Over the period studied, on average black people experienced 4.00 (exp(1.38849)) times more uses of force per person than white people in any given census tract.
+
+
+### Specification 2: Account for crime rate and racial make up
+
+
+$$y=n_je^{\beta_0 +   \alpha_j + \beta_{black} X_{black}  + \beta_{pov} X_{pov} + \beta_{pct b} X_{pct b} + \beta_{crime} X_{crime} }$$
+
+Where all variables are the same as previous with the addition of $X_{pct b}$ percent of a tract that is black, $X_{pov}$ the percent of the track below the federal poverty line, and $X_{crime}$ the number of reported part 1 (mandated federal reporting) crimes per 100 people in the census track.
+
+Improvements: 
+With pop by race as offset we are predicting number of use of force incidents per person in a race-tact group. It therefore makes sense not to use the absolute number of part 1 crimes per tract as a predictor but instead use the number of part1 crimes per person per tract as a predictor.
+
+```{r}
+
+m2 <- glmer(count ~ race + (1| tract_short) + pct_pov + pct_black + part1_per_capita, offset=log(pop_race), data=count_data, family = poisson())
+
+summary(m2)
+```
+**Interpret coefficients**:
+The effect of being black does not seem to have changed despite the addition of the control variables. On average black people experienced 4.00 (exp(1.385489)) times more uses of force per person than white people in any given census tract on top of the effects from the racial compositon, the number of serious crimes per person reported, and the poverty rate of the census tract.
+
+On average an increase of one part 1 crime per 100 people is associated with a  9.3% (exp(0.089058)) increase in use of force incidents holding all other variables constant (including race) within any given census tract. 
+
+Noticeably the tract percent black predictor indicates that a 1% increase share of black people in a census tract was associated with a 0.3% (1 - exp(-0.003193)) decline in use of force incidents. However that estimate was not statistically significant. This goes against both intuition that black people might be either more policed in a predominantly black neighborhood and that they would be more singled out in majority white communities. This does go along with the finding in "An Analysis of the New York City Police Department’s “Stop-and-Frisk” Policy in the Context of Claims of Racial Bias"" by Andrew GELMAN, Jeffrey FAGAN, and Alex KISS that fewer stops per violent crime or drug arrest were made in majority black neighborhoods, though the comparison is not really fair because that study used arrests not population as a baseline for stop counts.
+
+Also notably, although the effect of being black did not change between group variance went down from 1.809 in the first model to 1.039 meaning the estimate of the idosyncratic difference in force incidents between census tracts went down, which makes sense because we are accounting some of that variation with the control variables.
+
+
+### Specification 3: Interaction neighborhood wealth and race
+
+$$y=n_je^{\beta_0 +   \alpha_j + \beta_{black} X_{black}  + \beta_{pov} X_{pov} + \beta_{pct b} X_{pct b} + \beta_{crime} X_{crime} + \beta_{1} X_{pov}X_{black} }$$
+
+Where the newly added coefficent $\beta_1$ measure the interaction between race and percent poverty i.e. the differential effect of increasing neighborhood wealth on force against black versus white people.
+
+```{r}
+m3 <- glmer(count ~ race + (1| tract_short) + pct_pov + pct_black + part1_per_capita + pct_pov:race, offset=log(pop_race), data=count_data, family = poisson())
+
+summary(m3)
+```
+Note: there are some convergence issues with the random effects constants. Scaling the data could solve this.
+
+**Interpret coefficients**:
+The size of the effect of being black increased significantly. In this model, on average black people experience 10.09 (exp(2.3114623)) times (up from 4.00 times) more uses of force per person than white people in any given census tract on top of effects from the racial compositon, the number of serious crimes per person reported, and the poverty rate of the census tract.
+
+The reason for this change is that in the previous model, we were reporting an average additional force incidents against black people after assuming the increase in uses of force in wealthier areas was evenly distributed between the races. This model measures average effect of being black after acknowledging black and white people will be differently affected in wealthier neighborhoods.
+
+Additionally,the interaction term tells us that the increase in the number of incidents of force  grows 2.50% faster as census tracts get richer for black people than for white people . Particularly, we see the model predicts an *decrease* of -2.733108 incidents per 1000 people for a white person moving from a tract at the 25th to 75th percentile of wealth, but an *increase* 9.30473 incidents per 1000 people for a black person moving between the same two tracts.
+
+```{r}
+q <- quantile(count_data$pct_pov, c(.25,.75))
+mask <- (count_data$pct_pov %in% q)
+#count_data[mask,]
+preds <- predict(m3, count_data[mask,], type="response") *1000 #* count_data[mask,"pop_race"]
+a <- cbind(preds, count_data[mask,c("pct_pov", "part1_per_capita", "race")])
+diff(a[2:1, "preds"]); diff(a[4:3, "preds"])
+a
+```
+
+
+Not only does this model reveal new insights but it is fits the data much better than the previous models. While the second model decreased model deviance by 162.21 over the first model, the this model decreases model deviance by 775 over the first model. A low deviance is an indication that the model fits the data well.
+
+```{r}
+#1- pchisq(deviance(m1) - deviance(m3), attr(logLik(m3), "df") - attr(logLik(m1), "df"))
+anova(m1,m2,m3)
+```
+
+
+### Specification 4: adding murder
+
+I add an additional variable of the number of murders per 1000 people in census tract (across races) and an interaction of that term with being black.
+
+```{r}
+
+
+m6 <- glmer(count ~ race + (1| tract_short) + pct_pov + pct_black + part1_per_capita + murder_per_capita*race + pct_pov:race, offset=log(pop_race), data=count_data, family = poisson())
+
+summary(m6)
+```
+
+We see that the effect of being black is slightly raised to 10.72 (exp(2.3723281)). Although there are relatively large errors.
+
+We see that model deviance is slightly reduced suggesting a modest increase in fit to the data. The improvement is likely not great because I am adding information that is partly embedding in the part 1 crime variable.
+
+What I would ultimately like to do is change the offset to the part 1 crimes per 100 people variable. This would allow the model to estimate the number of force incidents per reported crime which would be a better baseline understand discrimination for comparable crimes, although obviously the reported crime rate is not the real crime rate and hieghtened police presence can increase the number of crimes found even though the underlying rates are not porportionaly elevated.
+
+Additionally the type of crime or the race of the subject would be good variables to think about in the future. A variable not present but which might be important is the number of years a given police officer has on the job.
+
+# Visualizations
+
+
+### Prep data
+```{r}
+## clean/prep data for visulization
+
+data <- viz_data
+
+# look at the values for each variable
+as.data.frame(table(data$race))
+as.data.frame(table(data$force))
+
+# remove missing values
+mask <- (data$race!="MISSING") & (data$force!="MISSING") & (!is.na(data$race))
+data <- data[mask, ]
+
+# get month
+data$date <- as.Date(data$date, format = "%m/%d/%Y")
+data$date <- format(data$date, "%m-%Y")
+
+```
+
+
+## Visualization 1
+
+- A line chart showing a rolling average of the number of use of force incidents by month. The window for the rolling average should be 6 months (so the observation for June should be the average of the counts from January-June).
+
+
+```{r}
+# create data
+by_month <- data %>% group_by(date) %>% summarise(count = n())
+by_month$date <- as.Date(as.yearmon(by_month$date, "%m-%Y"))
+by_month <- arrange(by_month, date)
+# create rolling avg
+by_month$MA <- rollapply(by_month$count, FUN=mean , width=6, align="right", fill=NA)
+
+
+ggplot(by_month) +
+  geom_line(aes(x=date, y = count)) +
+  labs(title="Six Month Monthly Rolling Avg.\n of Use of Force Incidents",
+       x="Time", y="# of Use of Force Incidents")
+
+
+```
+
+## Visualization 2
+
+- A stacked bar chart showing the percentage of use of force incidents by type of force used, broken down by race (one bar for each race, each level in the bar should indicate the type of force used, the thickness of each layer should correspond to the percentage of incidents involving that race and force type; each bar should sum to 100).
+
+```{r}
+
+ticks <- c("ACCIDENTAL\n DISCHARGE",              
+ "CHEMICAL IRRITANT",                 
+"INJURY TO PRISONER",                
+ "NONCOMPLIANT\n SUSPECT/ARRESTEE",     
+"TASER-BEANBAG\nPEPPERBALL-40MM FOAM",
+ "USE OF FORCE\n INVESTIGATION",        
+ "WEAPON DISCHARGE\n AT AN ANIMAL" )
+
+ggplot(data) +
+  geom_bar(aes(x=factor(force), fill=factor(race)), position="fill") +
+  theme(axis.text.x = element_text(angle= 35, vjust = 1, hjust=1)) +
+  scale_x_discrete(labels= ticks) +
+  labs(title="Racial Distribution of Force Incidents\n (as percent)", y="percent", x="Force Type", fill="Race")
+
+
+ggplot(data) +
+  geom_bar(aes(x=factor(force), fill=factor(race))) +
+  theme(axis.text.x = element_text(angle= 35, vjust = 1, hjust=1)) +
+  scale_x_discrete(labels= ticks) +
+  labs(title="Racial Distribution of Force Incidents\n(by counts)", y="# of Incidents", x="Force Type", fill="Race")
+
+```
+
+
+
+
+## Visualization 3
+
+- A bar chart showing the number of use-of-force incidents per 1000 residents broken down by race (one bar for each race).
+
+I dropped race categories "VALUE_NOT_KNOWN" and  "MULTI_RACIAL"  for this visualization. It would be impossible to get the underlying number of people in the area under study who would be categorized "VALUE_NOT_KNOWN". It was difficult to determine in the given time whether  "MULTI_RACIAL" overlapped with other racial categories so that was also not included.
+
+```{r}
+
+pop <- viz_pop
+
+mask <- !(data$race %in% c("VALUE_NOT_KNOWN", "MULTI_RACIAL"))
+data <- data[mask,]
+tracts <- intersect(data$tract_short, pop$tract_short)
+a <- pop[pop$tract_short %in% tracts,-c(1:2,8)]
+data <- data[data$tract_short %in% tracts,]
+# total residents by race
+total_pop <- data.frame(totals = colSums(a), race=names(colSums(a))) %>% 
+  arrange(race)
+
+# get use of force counts by race
+race_count <- group_by(data, race) %>% summarise(count = n()) %>% arrange(race)
+race_count$race <- tolower(race_count$race)
+# get per 1000 in each race
+race_count$per_1000 <-  (race_count$count/total_pop$totals) * 1000
+
+
+ggplot(race_count) +
+  geom_col(aes(x=race, y=per_1000, fill=race)) +
+  labs(title="Force Incidents per 1000 People\n by Race", y="# of Incidents", x="Race", fill="Race")
+
+
+
+
+```
+
+
+
+
+
+
